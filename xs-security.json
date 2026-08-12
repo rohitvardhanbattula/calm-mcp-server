@@ -1,0 +1,38 @@
+{
+  "xsappname": "calm-mcp-server",
+  "tenant-mode": "dedicated",
+  "description": "SAP Cloud ALM MCP Server — XSUAA security config",
+  "scopes": [
+    { "name": "$XSAPPNAME.read",  "description": "Read access to CALM via MCP" },
+    { "name": "$XSAPPNAME.write", "description": "Write access to CALM via MCP" }
+  ],
+  "role-templates": [
+    {
+      "name": "CalmMcpViewer",
+      "description": "Read-only access to CALM MCP tools",
+      "scope-references": ["$XSAPPNAME.read"]
+    },
+    {
+      "name": "CalmMcpEditor",
+      "description": "Read and write access to CALM MCP tools",
+      "scope-references": ["$XSAPPNAME.read", "$XSAPPNAME.write"]
+    }
+  ],
+  "oauth2-configuration": {
+    "redirect-uris": [
+      "https://claude.ai/api/mcp/auth_callback",
+      "https://chat.openai.com/aip/*/oauth/callback",
+      "https://chatgpt.com/aip/*/oauth/callback",
+      "https://chatgpt.com/oauth/callback",
+      "https://chatgpt.com/connector_platform_oauth_redirect",
+      "https://chatgpt.com/connector/oauth/**",
+      "https://copilot.microsoft.com/**",
+      "https://global.consent.azure-apim.net/redirect/**",
+      "https://*.cfapps.*.hana.ondemand.com/**",
+      "http://localhost:3000/oauth/callback",
+      "cursor://anysphere.cursor-retrieval/oauth/*/callback"
+    ],
+    "token-validity": 3600,
+    "refresh-token-validity": 86400
+  }
+}

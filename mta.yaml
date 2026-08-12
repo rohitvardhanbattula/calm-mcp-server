@@ -1,0 +1,49 @@
+_schema-version: '3.2'
+ID: calm-mcp-server
+version: 1.0.0
+description: "SAP Cloud ALM MCP Server — hosted on BTP Cloud Foundry"
+
+parameters:
+  enable-parallel-deployments: true
+
+build-parameters:
+  before-all:
+    - builder: custom
+      commands:
+        - npm install
+        - npm run build
+
+modules:
+  - name: calm-mcp-server-app
+    type: nodejs
+    path: .
+    build-parameters:
+      ignore:
+        - node_modules/
+    parameters:
+      memory: 512M
+      disk-quota: 1G
+      # CALM credentials are injected here as environment variables.
+      # Fill these in via 'cf set-env' or BTP cockpit — never hardcode secrets.
+      
+        # CALM_CLIENT_ID and CALM_CLIENT_SECRET must be set externally:
+        #   cf set-env calm-mcp-server-app CALM_CLIENT_ID     "<your-client-id>"
+        #   cf set-env calm-mcp-server-app CALM_CLIENT_SECRET "<your-client-secret>"
+        #   cf restage calm-mcp-server-app
+    requires:
+      - name: calm-mcp-uaa
+    provides:
+      - name: calm_mcp_api
+        properties:
+          url: ${default-url}
+
+resources:
+  - name: calm-mcp-uaa
+    type: org.cloudfoundry.managed-service
+    parameters:
+      service: xsuaa
+      service-plan: application
+      path: ./xs-security.json
+      config:
+        xsappname: calm-mcp-server
+        tenant-mode: dedicated

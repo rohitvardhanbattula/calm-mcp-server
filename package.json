@@ -1,0 +1,33 @@
+{
+  "name": "calm-mcp-server",
+  "version": "1.0.0",
+  "description": "SAP Cloud ALM MCP Server — BTP-hosted, XSUAA-secured",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.25.2",
+    "@sap/xsenv": "^4.2.0",
+    "@sap/xssec": "^3.6.2",
+    "cors": "^2.8.5",
+    "express": "^5.2.1",
+    "passport": "^0.7.0"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/node": "^22.0.0",
+    "@types/passport": "^1.0.17",
+    "@types/sap__xsenv": "^3.3.2",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=20.x"
+  }
+}
