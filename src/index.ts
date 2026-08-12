@@ -9,6 +9,11 @@
  *   CALM_UAA_URL       https://<subdomain>.authentication.us10.hana.ondemand.com
  *   CALM_CLIENT_ID     (your OAuth client id)
  *   CALM_CLIENT_SECRET (your OAuth client secret)
+ *
+ * FIX: A fresh Server instance is created per SSE session.
+ * The MCP SDK's Server class only supports one active transport at a time.
+ * Reusing a singleton across reconnects triggers:
+ *   "Already connected to a transport. Call close() before connecting..."
  */
 
 import express, { type Request, type Response, type NextFunction } from 'express';
@@ -17,11 +22,10 @@ import xsenv from '@sap/xsenv';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
-import type {} from 'passport'; // ensure passport's Express.Request augmentation is loaded
+import type {} from 'passport';
 import { TOOLS } from './tools.js';
 import { CalmClient, readConfig } from './calmClient.js';
 
-// @sap/xssec and passport ship no TS declarations — use require via esModuleInterop
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const xssec = require('@sap/xssec') as { JWTStrategy: new (creds: unknown) => unknown };
 // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -43,7 +47,7 @@ const port = (process.env.PORT ?? 8080) as number;
 // Trust BTP Gorouter so req.protocol is https, not http
 app.set('trust proxy', true);
 
-// ── CALM client (uses env vars — never hardcoded) ──────────────────────────
+// ── CALM client ────────────────────────────────────────────────────────────
 
 const calmConfig = readConfig();
 const calm = new CalmClient(calmConfig);
@@ -61,7 +65,6 @@ try {
   process.exit(1);
 }
 
-// passport.use() accepts (name, strategy) but our minimal typing only has 1-arg form
 (passport as unknown as { use(name: string, s: unknown): void })
   .use('jwt', new xssec.JWTStrategy(uaaCredentials));
 app.use(passport.initialize());
@@ -76,10 +79,11 @@ app.use(
   }),
 );
 
+// 🔥 CRITICAL: DO NOT add express.json() here.
+// The MCP SDK reads the raw request stream. If Express parses it first, the SDK times out.
+
 // ── Helpers ───────────────────────────────────────────────────────────────
 
-// passport augments express.Request with authInfo?: Express.AuthInfo
-// We extend that so downstream code can access it without type errors.
 type AuthRequest = Request & { authInfo?: Express.AuthInfo };
 
 function baseUrl(req: Request): string {
@@ -145,20 +149,202 @@ app.get(
   },
 );
 
-// ── MCP Server + Sessions ─────────────────────────────────────────────────
-
-const mcpServer = new Server(
-  { name: 'calm-mcp-server', version: '1.0.0' },
-  { capabilities: { tools: {} } },
-);
+// ── Sessions ──────────────────────────────────────────────────────────────
 
 interface Session {
   transport: SSEServerTransport;
+  server: Server;           // ← one Server instance per session
   heartbeat: NodeJS.Timeout | null;
 }
 const sessions = new Map<string, Session>();
 
+// ── Tool handler factory ──────────────────────────────────────────────────
+// Extracted so it can be registered on every per-session Server instance.
+
+function registerToolHandlers(server: Server): void {
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
+
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const { name, arguments: args } = request.params;
+    const a = (args ?? {}) as Record<string, unknown>;
+
+    console.log(`🛠️  Tool: ${name}`);
+
+    function str(key: string): string {
+      return String(a[key] ?? '');
+    }
+    function odataParams(): Record<string, string> {
+      const p: Record<string, string> = {};
+      if (a['top'])  p['$top']  = String(a['top']);
+      if (a['skip']) p['$skip'] = String(a['skip']);
+      return p;
+    }
+    function resultText(r: unknown): string {
+      return JSON.stringify(r, null, 2);
+    }
+    function errorText(label: string, err: string, status?: number): string {
+      return `❌ ${label} failed${status ? ` (HTTP ${status})` : ''}: ${err}`;
+    }
+
+    try {
+      switch (name) {
+        // ── Projects ──────────────────────────────────────────────────────
+        case 'calm_projects_list': {
+          const params = odataParams();
+          if (a['status']) params['$filter'] = `status eq '${a['status']}'`;
+          const r = await calm.listProjects(params);
+          if (!r.ok) return { content: [{ type: 'text', text: errorText('calm_projects_list', r.error, r.status) }], isError: true };
+          return { content: [{ type: 'text', text: resultText(r.data) }] };
+        }
+        case 'calm_projects_get': {
+          const r = await calm.getProject(str('projectId'));
+          if (!r.ok) return { content: [{ type: 'text', text: errorText('calm_projects_get', r.error, r.status) }], isError: true };
+          return { content: [{ type: 'text', text: resultText(r.data) }] };
+        }
+
+        // ── Tasks ──────────────────────────────────────────────────────────
+        case 'calm_tasks_list': {
+          const params = odataParams();
+          if (a['status'])     params['status']     = str('status');
+          if (a['assigneeId']) params['assigneeId'] = str('assigneeId');
+          const r = await calm.listTasks(str('projectId'), params);
+          if (!r.ok) return { content: [{ type: 'text', text: errorText('calm_tasks_list', r.error, r.status) }], isError: true };
+          return { content: [{ type: 'text', text: resultText(r.data) }] };
+        }
+        case 'calm_tasks_get': {
+          const r = await calm.getTask(str('taskId'));
+          if (!r.ok) return { content: [{ type: 'text', text: errorText('calm_tasks_get', r.error, r.status) }], isError: true };
+          return { content: [{ type: 'text', text: resultText(r.data) }] };
+        }
+        case 'calm_tasks_create': {
+          const payload: Record<string, unknown> = {
+            projectId: str('projectId'),
+            title: str('title'),
+          };
+          if (a['description']) payload['description'] = str('description');
+          if (a['status'])      payload['status']      = str('status');
+          if (a['priorityId'])  payload['priorityId']  = str('priorityId');
+          if (a['assigneeId'])  payload['assigneeId']  = str('assigneeId');
+          if (a['dueDate'])     payload['dueDate']     = str('dueDate');
+          const r = await calm.createTask(payload);
+          if (!r.ok) return { content: [{ type: 'text', text: errorText('calm_tasks_create', r.error, r.status) }], isError: true };
+          return { content: [{ type: 'text', text: resultText(r.data) }] };
+        }
+        case 'calm_tasks_update': {
+          const payload: Record<string, unknown> = {};
+          for (const field of ['title', 'description', 'status', 'priorityId', 'assigneeId', 'dueDate']) {
+            if (a[field] !== undefined) payload[field] = a[field];
+          }
+          const r = await calm.updateTask(str('taskId'), payload);
+          if (!r.ok) return { content: [{ type: 'text', text: errorText('calm_tasks_update', r.error, r.status) }], isError: true };
+          return { content: [{ type: 'text', text: resultText(r.data) }] };
+        }
+        case 'calm_tasks_delete': {
+          const r = await calm.deleteTask(str('taskId'));
+          if (!r.ok) return { content: [{ type: 'text', text: errorText('calm_tasks_delete', r.error, r.status) }], isError: true };
+          return { content: [{ type: 'text', text: '✅ Task deleted.' }] };
+        }
+
+        // ── Features ──────────────────────────────────────────────────────
+        case 'calm_features_list': {
+          const params = odataParams();
+          const filters: string[] = [`projectId eq '${str('projectId')}'`];
+          if (a['statusCode'])   filters.push(`statusCode eq '${a['statusCode']}'`);
+          if (a['priorityCode']) filters.push(`priorityCode eq '${a['priorityCode']}'`);
+          params['$filter'] = filters.join(' and ');
+          const r = await calm.listFeatures(str('projectId'), params);
+          if (!r.ok) return { content: [{ type: 'text', text: errorText('calm_features_list', r.error, r.status) }], isError: true };
+          return { content: [{ type: 'text', text: resultText(r.data) }] };
+        }
+        case 'calm_features_get': {
+          const r = await calm.getFeature(str('featureId'));
+          if (!r.ok) return { content: [{ type: 'text', text: errorText('calm_features_get', r.error, r.status) }], isError: true };
+          return { content: [{ type: 'text', text: resultText(r.data) }] };
+        }
+        case 'calm_features_create': {
+          const payload: Record<string, unknown> = {
+            projectId: str('projectId'),
+            title: str('title'),
+          };
+          for (const field of ['description', 'statusCode', 'priorityCode', 'responsibleId']) {
+            if (a[field] !== undefined) payload[field] = a[field];
+          }
+          const r = await calm.createFeature(payload);
+          if (!r.ok) return { content: [{ type: 'text', text: errorText('calm_features_create', r.error, r.status) }], isError: true };
+          return { content: [{ type: 'text', text: resultText(r.data) }] };
+        }
+        case 'calm_features_update': {
+          const payload: Record<string, unknown> = {};
+          for (const field of ['title', 'description', 'statusCode', 'priorityCode', 'responsibleId']) {
+            if (a[field] !== undefined) payload[field] = a[field];
+          }
+          const r = await calm.updateFeature(str('featureId'), payload);
+          if (!r.ok) return { content: [{ type: 'text', text: errorText('calm_features_update', r.error, r.status) }], isError: true };
+          return { content: [{ type: 'text', text: resultText(r.data) }] };
+        }
+        case 'calm_features_delete': {
+          const r = await calm.deleteFeature(str('featureId'));
+          if (!r.ok) return { content: [{ type: 'text', text: errorText('calm_features_delete', r.error, r.status) }], isError: true };
+          return { content: [{ type: 'text', text: '✅ Feature deleted.' }] };
+        }
+
+        // ── Documents ──────────────────────────────────────────────────────
+        case 'calm_documents_list': {
+          const params = odataParams();
+          if (a['type'])   params['$filter'] = `type eq '${a['type']}'`;
+          if (a['status']) {
+            params['$filter'] = params['$filter']
+              ? `${params['$filter']} and status eq '${a['status']}'`
+              : `status eq '${a['status']}'`;
+          }
+          const r = await calm.listDocuments(params);
+          if (!r.ok) return { content: [{ type: 'text', text: errorText('calm_documents_list', r.error, r.status) }], isError: true };
+          return { content: [{ type: 'text', text: resultText(r.data) }] };
+        }
+        case 'calm_documents_get': {
+          const r = await calm.getDocument(str('documentId'));
+          if (!r.ok) return { content: [{ type: 'text', text: errorText('calm_documents_get', r.error, r.status) }], isError: true };
+          return { content: [{ type: 'text', text: resultText(r.data) }] };
+        }
+
+        // ── Hierarchy ──────────────────────────────────────────────────────
+        case 'calm_hierarchy_list': {
+          const params = odataParams();
+          if (a['parentId']) params['$filter'] = `parentId eq '${a['parentId']}'`;
+          const r = await calm.listHierarchy(params);
+          if (!r.ok) return { content: [{ type: 'text', text: errorText('calm_hierarchy_list', r.error, r.status) }], isError: true };
+          return { content: [{ type: 'text', text: resultText(r.data) }] };
+        }
+
+        // ── Process Monitoring ─────────────────────────────────────────────
+        case 'calm_processes_list': {
+          const r = await calm.listBusinessProcesses(odataParams());
+          if (!r.ok) return { content: [{ type: 'text', text: errorText('calm_processes_list', r.error, r.status) }], isError: true };
+          return { content: [{ type: 'text', text: resultText(r.data) }] };
+        }
+
+        // ── Analytics ──────────────────────────────────────────────────────
+        case 'calm_analytics_query': {
+          const extraParams = (a['params'] as Record<string, string> | undefined) ?? {};
+          const r = await calm.queryAnalytics(str('endpoint'), extraParams);
+          if (!r.ok) return { content: [{ type: 'text', text: errorText('calm_analytics_query', r.error, r.status) }], isError: true };
+          return { content: [{ type: 'text', text: resultText(r.data) }] };
+        }
+
+        default:
+          return { content: [{ type: 'text', text: `❌ Unknown tool: ${name}` }], isError: true };
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return { content: [{ type: 'text', text: `❌ Unexpected error in ${name}: ${msg}` }], isError: true };
+    }
+  });
+}
+
 // ── SSE endpoint ──────────────────────────────────────────────────────────
+// KEY FIX: create a NEW Server instance for every SSE connection.
+// The MCP SDK Server class only allows one active transport at a time, so
+// reusing a singleton causes "Already connected to a transport" on reconnect.
 
 app.get('/sse', authMiddleware, async (req: AuthRequest, res: Response) => {
   res.setHeader('Content-Type', 'text/event-stream');
@@ -166,13 +352,20 @@ app.get('/sse', authMiddleware, async (req: AuthRequest, res: Response) => {
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('X-Accel-Buffering', 'no');
 
+  // Fresh Server per session — avoids the "already connected" error
+  const server = new Server(
+    { name: 'calm-mcp-server', version: '1.0.0' },
+    { capabilities: { tools: {} } },
+  );
+  registerToolHandlers(server);
+
   const transport = new SSEServerTransport('/messages', res);
   const sessionId = transport.sessionId;
-  sessions.set(sessionId, { transport, heartbeat: null });
+  sessions.set(sessionId, { transport, server, heartbeat: null });
   console.log(`🔌 SSE session opened: ${sessionId}`);
 
   try {
-    await mcpServer.connect(transport);
+    await server.connect(transport);
 
     const heartbeat = setInterval(() => {
       if (!res.writableEnded) res.write(': keep-alive\n\n');
@@ -189,7 +382,7 @@ app.get('/sse', authMiddleware, async (req: AuthRequest, res: Response) => {
     const session = sessions.get(sessionId);
     if (session?.heartbeat) clearInterval(session.heartbeat);
     sessions.delete(sessionId);
-    console.log(`⚠️ SSE session closed: ${sessionId}`);
+    console.log(`⚠️  SSE session closed: ${sessionId}`);
   });
 });
 
@@ -199,6 +392,7 @@ const messageHandler = async (req: AuthRequest, res: Response): Promise<void> =>
   const sessionId = req.query['sessionId'] as string;
   const session = sessions.get(sessionId);
   if (!session) {
+    console.error(`❌ Session ${sessionId} not found. Active sessions:`, Array.from(sessions.keys()));
     res.status(400).json({ error: 'Session not found — reconnect required.' });
     return;
   }
@@ -212,190 +406,10 @@ const messageHandler = async (req: AuthRequest, res: Response): Promise<void> =>
 app.post('/messages', authMiddleware, messageHandler);
 app.post('/sse', authMiddleware, messageHandler);
 
-// ── Tool registry ─────────────────────────────────────────────────────────
-
-mcpServer.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
-
-mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
-  const a = (args ?? {}) as Record<string, unknown>;
-
-  console.log(`🛠️  Tool: ${name}`);
-
-  function str(key: string): string {
-    return String(a[key] ?? '');
-  }
-  function odataParams(): Record<string, string> {
-    const p: Record<string, string> = {};
-    if (a['top']) p['$top'] = String(a['top']);
-    if (a['skip']) p['$skip'] = String(a['skip']);
-    return p;
-  }
-  function resultText(r: unknown): string {
-    return JSON.stringify(r, null, 2);
-  }
-  function errorText(label: string, err: string, status?: number): string {
-    return `❌ ${label} failed${status ? ` (HTTP ${status})` : ''}: ${err}`;
-  }
-
-  try {
-    switch (name) {
-      // ── Projects ──────────────────────────────────────────────────────────
-      case 'calm_projects_list': {
-        const params = odataParams();
-        if (a['status']) params['$filter'] = `status eq '${a['status']}'`;
-        const r = await calm.listProjects(params);
-        if (!r.ok) return { content: [{ type: 'text', text: errorText('calm_projects_list', r.error, r.status) }], isError: true };
-        return { content: [{ type: 'text', text: resultText(r.data) }] };
-      }
-      case 'calm_projects_get': {
-        const r = await calm.getProject(str('projectId'));
-        if (!r.ok) return { content: [{ type: 'text', text: errorText('calm_projects_get', r.error, r.status) }], isError: true };
-        return { content: [{ type: 'text', text: resultText(r.data) }] };
-      }
-
-      // ── Tasks ─────────────────────────────────────────────────────────────
-      case 'calm_tasks_list': {
-        const params = odataParams();
-        if (a['status']) params['status'] = str('status');
-        if (a['assigneeId']) params['assigneeId'] = str('assigneeId');
-        const r = await calm.listTasks(str('projectId'), params);
-        if (!r.ok) return { content: [{ type: 'text', text: errorText('calm_tasks_list', r.error, r.status) }], isError: true };
-        return { content: [{ type: 'text', text: resultText(r.data) }] };
-      }
-      case 'calm_tasks_get': {
-        const r = await calm.getTask(str('taskId'));
-        if (!r.ok) return { content: [{ type: 'text', text: errorText('calm_tasks_get', r.error, r.status) }], isError: true };
-        return { content: [{ type: 'text', text: resultText(r.data) }] };
-      }
-      case 'calm_tasks_create': {
-        const payload: Record<string, unknown> = {
-          projectId: str('projectId'),
-          title: str('title'),
-        };
-        if (a['description']) payload['description'] = str('description');
-        if (a['status']) payload['status'] = str('status');
-        if (a['priorityId']) payload['priorityId'] = str('priorityId');
-        if (a['assigneeId']) payload['assigneeId'] = str('assigneeId');
-        if (a['dueDate']) payload['dueDate'] = str('dueDate');
-        const r = await calm.createTask(payload);
-        if (!r.ok) return { content: [{ type: 'text', text: errorText('calm_tasks_create', r.error, r.status) }], isError: true };
-        return { content: [{ type: 'text', text: resultText(r.data) }] };
-      }
-      case 'calm_tasks_update': {
-        const payload: Record<string, unknown> = {};
-        for (const field of ['title', 'description', 'status', 'priorityId', 'assigneeId', 'dueDate']) {
-          if (a[field] !== undefined) payload[field] = a[field];
-        }
-        const r = await calm.updateTask(str('taskId'), payload);
-        if (!r.ok) return { content: [{ type: 'text', text: errorText('calm_tasks_update', r.error, r.status) }], isError: true };
-        return { content: [{ type: 'text', text: resultText(r.data) }] };
-      }
-      case 'calm_tasks_delete': {
-        const r = await calm.deleteTask(str('taskId'));
-        if (!r.ok) return { content: [{ type: 'text', text: errorText('calm_tasks_delete', r.error, r.status) }], isError: true };
-        return { content: [{ type: 'text', text: '✅ Task deleted.' }] };
-      }
-
-      // ── Features ──────────────────────────────────────────────────────────
-      case 'calm_features_list': {
-        const params = odataParams();
-        const filters: string[] = [`projectId eq '${str('projectId')}'`];
-        if (a['statusCode']) filters.push(`statusCode eq '${a['statusCode']}'`);
-        if (a['priorityCode']) filters.push(`priorityCode eq '${a['priorityCode']}'`);
-        params['$filter'] = filters.join(' and ');
-        const r = await calm.listFeatures(str('projectId'), params);
-        if (!r.ok) return { content: [{ type: 'text', text: errorText('calm_features_list', r.error, r.status) }], isError: true };
-        return { content: [{ type: 'text', text: resultText(r.data) }] };
-      }
-      case 'calm_features_get': {
-        const r = await calm.getFeature(str('featureId'));
-        if (!r.ok) return { content: [{ type: 'text', text: errorText('calm_features_get', r.error, r.status) }], isError: true };
-        return { content: [{ type: 'text', text: resultText(r.data) }] };
-      }
-      case 'calm_features_create': {
-        const payload: Record<string, unknown> = {
-          projectId: str('projectId'),
-          title: str('title'),
-        };
-        for (const field of ['description', 'statusCode', 'priorityCode', 'responsibleId']) {
-          if (a[field] !== undefined) payload[field] = a[field];
-        }
-        const r = await calm.createFeature(payload);
-        if (!r.ok) return { content: [{ type: 'text', text: errorText('calm_features_create', r.error, r.status) }], isError: true };
-        return { content: [{ type: 'text', text: resultText(r.data) }] };
-      }
-      case 'calm_features_update': {
-        const payload: Record<string, unknown> = {};
-        for (const field of ['title', 'description', 'statusCode', 'priorityCode', 'responsibleId']) {
-          if (a[field] !== undefined) payload[field] = a[field];
-        }
-        const r = await calm.updateFeature(str('featureId'), payload);
-        if (!r.ok) return { content: [{ type: 'text', text: errorText('calm_features_update', r.error, r.status) }], isError: true };
-        return { content: [{ type: 'text', text: resultText(r.data) }] };
-      }
-      case 'calm_features_delete': {
-        const r = await calm.deleteFeature(str('featureId'));
-        if (!r.ok) return { content: [{ type: 'text', text: errorText('calm_features_delete', r.error, r.status) }], isError: true };
-        return { content: [{ type: 'text', text: '✅ Feature deleted.' }] };
-      }
-
-      // ── Documents ─────────────────────────────────────────────────────────
-      case 'calm_documents_list': {
-        const params = odataParams();
-        if (a['type']) params['$filter'] = `type eq '${a['type']}'`;
-        if (a['status']) {
-          params['$filter'] = params['$filter']
-            ? `${params['$filter']} and status eq '${a['status']}'`
-            : `status eq '${a['status']}'`;
-        }
-        const r = await calm.listDocuments(params);
-        if (!r.ok) return { content: [{ type: 'text', text: errorText('calm_documents_list', r.error, r.status) }], isError: true };
-        return { content: [{ type: 'text', text: resultText(r.data) }] };
-      }
-      case 'calm_documents_get': {
-        const r = await calm.getDocument(str('documentId'));
-        if (!r.ok) return { content: [{ type: 'text', text: errorText('calm_documents_get', r.error, r.status) }], isError: true };
-        return { content: [{ type: 'text', text: resultText(r.data) }] };
-      }
-
-      // ── Hierarchy ─────────────────────────────────────────────────────────
-      case 'calm_hierarchy_list': {
-        const params = odataParams();
-        if (a['parentId']) params['$filter'] = `parentId eq '${a['parentId']}'`;
-        const r = await calm.listHierarchy(params);
-        if (!r.ok) return { content: [{ type: 'text', text: errorText('calm_hierarchy_list', r.error, r.status) }], isError: true };
-        return { content: [{ type: 'text', text: resultText(r.data) }] };
-      }
-
-      // ── Process Monitoring ────────────────────────────────────────────────
-      case 'calm_processes_list': {
-        const r = await calm.listBusinessProcesses(odataParams());
-        if (!r.ok) return { content: [{ type: 'text', text: errorText('calm_processes_list', r.error, r.status) }], isError: true };
-        return { content: [{ type: 'text', text: resultText(r.data) }] };
-      }
-
-      // ── Analytics ─────────────────────────────────────────────────────────
-      case 'calm_analytics_query': {
-        const extraParams = (a['params'] as Record<string, string> | undefined) ?? {};
-        const r = await calm.queryAnalytics(str('endpoint'), extraParams);
-        if (!r.ok) return { content: [{ type: 'text', text: errorText('calm_analytics_query', r.error, r.status) }], isError: true };
-        return { content: [{ type: 'text', text: resultText(r.data) }] };
-      }
-
-      default:
-        return { content: [{ type: 'text', text: `❌ Unknown tool: ${name}` }], isError: true };
-    }
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    return { content: [{ type: 'text', text: `❌ Unexpected error in ${name}: ${msg}` }], isError: true };
-  }
-});
-
 // ── Health check ──────────────────────────────────────────────────────────
 
 app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', server: 'calm-mcp-server', version: '1.0.0' });
+  res.json({ status: 'ok', server: 'calm-mcp-server', version: '1.0.0', activeSessions: sessions.size });
 });
 
 // ── Start ─────────────────────────────────────────────────────────────────
