@@ -171,11 +171,11 @@ export class CalmClient {
 
   // ── Projects ──────────────────────────────────────────────────────────────
   listProjects(params?: Record<string, string>) {
-    return calmFetch(this.cfg, 'GET', '/calm-processmanagement/v1/projects', params);
+    return calmFetch(this.cfg, 'GET', '/calm-projects/v1/projects', params);
   }
 
   getProject(projectId: string) {
-    return calmFetch(this.cfg, 'GET', `/calm-processmanagement/v1/projects/${encodeURIComponent(projectId)}`);
+    return calmFetch(this.cfg, 'GET', `/calm-projects/v1/projects/${encodeURIComponent(projectId)}`);
   }
 
   // ── Tasks ─────────────────────────────────────────────────────────────────
@@ -224,17 +224,19 @@ export class CalmClient {
   }
 
   // ── Documents ─────────────────────────────────────────────────────────────
+  // CALM_SD API: https://api.sap.com/api/CALM_SD/resource
   listDocuments(params?: Record<string, string>) {
-    return calmFetch(this.cfg, 'GET', '/calm-processmanagement/v1/documents', params);
+    return calmFetch(this.cfg, 'GET', '/calm-sd/v1/documents', params);
   }
 
   getDocument(documentId: string) {
-    return calmFetch(this.cfg, 'GET', `/calm-processmanagement/v1/documents/${encodeURIComponent(documentId)}`);
+    return calmFetch(this.cfg, 'GET', `/calm-sd/v1/documents/${encodeURIComponent(documentId)}`);
   }
 
   // ── Hierarchy ─────────────────────────────────────────────────────────────
+  // Process Hierarchy API: https://api.sap.com/api/CALM_PH/resource
   listHierarchy(params?: Record<string, string>) {
-    return calmFetch(this.cfg, 'GET', '/calm-processmanagement/v1/hierarchy', params);
+    return calmFetch(this.cfg, 'GET', '/calm-processmanagement/v1/processHierarchyNodes', params);
   }
 
   // ── Process Monitoring ────────────────────────────────────────────────────
